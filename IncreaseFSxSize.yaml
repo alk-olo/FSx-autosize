@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Creates an Amazon CloudWatch alarm and Lambda function to increase the FSx storage
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: File System Parameters
+      Parameters:
+        - FileSystemId
+    - Label:
+        default: Alarm Notification
+      Parameters:
+        - LowFreeDataStorageCapacityThreshold
+        - LowFreeDataStorageCapacityThresholdUnit       
+        - EmailAddress
+
+Parameters:
+  EmailAddress:
+    Description: The email address for alarm notification.
+    Type: String
+    AllowedPattern: ^\w+([-+.']\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*$
+
+  FileSystemId:
+    AllowedPattern: ^(fs-)([a-z0-9]{17})$
+    Description: Amazon FSx file system ID
+    Type: String
+
+  LowFreeDataStorageCapacityThreshold:
+    Description: Low free data storage capacity threshold (GiB or %)
+    Type: Number
+    MaxValue: 65536
+    MinValue: 1
+
+  LowFreeDataStorageCapacityThresholdUnit:
+    Description: Specify the Storage Capacity threshold Unit (GiB or %)
+    Type: String
+    AllowedValues:
+      - "GiB"
+      - "%"
+    Default: "%"
+
+
+  PercentIncrease:
+    Description: Provide the percent increase for File System Storage. This value should be between 10 and 100
+    ConstraintDescription: Please, enter the value between 10 and 100
+    Type: Number
+    #AllowedPattern:  ^(\d{1,2}|100)%?$
+    MaxValue: 100
+    MinValue: 10
+
+  AlarmModificationNotification:
+    Description: Would you like to adjust the percent increase for the next FSx storage increase event proportionate to the requested increase?
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "Yes"
+
+
+Resources:
+  CalculateFreeSpace:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Timeout: 5
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          def lambda_handler(event, context):
+            print(event)
+            logger = logging.getLogger()
+            logger.setLevel(logging.DEBUG)
+            responseData = {}
+            physicalResourceId = {}
+
+            client= boto3.client ('fsx') 
+            FSXFileSystemId = event['ResourceProperties']['FileSystemID']
+            response = client.describe_file_systems(FileSystemIds=[FSXFileSystemId,],MaxResults=123)
+
+            FileSystemFreeSpaceInt = int(event['ResourceProperties']['FileSystemThreshold'])
+            FileSystemFreeSpaceUnit = event['ResourceProperties']['FileSystemThresholdUnit']
+            FileSystemCapacity = response['FileSystems'][0]['StorageCapacity']
+            FileSystemCapacityBytes = FileSystemCapacity * 1073741824
+
+            try:
+              if event['RequestType'] == 'Delete':
+                logger.info('Deleted!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+
+              elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                logger.info('Create or Update Event Received')
+
+                if FileSystemFreeSpaceUnit == 'GiB':
+        
+                  FileSystemFreeSpacebytes = FileSystemFreeSpaceInt * 1073741824
+                  if FileSystemFreeSpacebytes >= FileSystemCapacityBytes:
+                    logger.exception('Signaling failure to CloudFormation. The value of Free Storage threshold provided is larger than the File System Storage Capacity')
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                    return
+                  else:
+                    responseData = {'Response': FileSystemFreeSpacebytes}
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, physicalResourceId)
+                    return
+
+                else:
+
+                  FileSystemFreeSpacebytes = FileSystemCapacityBytes * FileSystemFreeSpaceInt/100
+                  if FileSystemFreeSpacebytes >= FileSystemCapacityBytes:
+                    logger.exception('Signaling failure to CloudFormation. The value of Free Storage threshold provided is larger than the File System Storage Capacity')
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                    return
+                  else:
+                    responseData = {'Response': FileSystemFreeSpacebytes}
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, physicalResourceId)
+                    return
+    
+            except Exception: 
+              logger.exception('Signaling failure to CloudFormation.')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CalculateSize-Role-${AWS::StackName}-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: {Service: [lambda.amazonaws.com]}
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: !Sub FSxCustom-Resource-Policy-${AWS::StackName}-${AWS::Region}
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Effect: Allow
+            Action:
+            - fsx:DescribeFileSystems
+            Resource: '*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+  GetSpaceinBytes:
+    Type: Custom::FreeSpaceinBytes
+    Properties:
+      ServiceToken: !GetAtt CalculateFreeSpace.Arn
+      FileSystemThreshold: !Ref LowFreeDataStorageCapacityThreshold
+      FileSystemThresholdUnit: !Ref LowFreeDataStorageCapacityThresholdUnit
+      FileSystemID: !Ref FileSystemId
+  FSxResizer:
+    Type: AWS::Lambda::Function
+    DependsOn: FSxResizerRole
+    Properties:
+      FunctionName: !Sub FSxResizer-${FileSystemId}-${AWS::StackName}
+      Description: Lambda function that increases the FSx storage size
+      Environment:
+        Variables:
+          PercentIncrease: !Sub ${PercentIncrease}
+          UpdateThreshold: !Sub ${AlarmModificationNotification}
+      Handler: FSxResize::FSxResize.Bootstrap::ExecuteFunction
+      Role: !Sub ${FSxResizerRole.Arn}
+      Code:
+        S3Bucket: !Sub solution-references-${AWS::Region}
+        S3Key: 'fsx/DynamicScaling/FSxResize.zip'
+      Runtime: dotnetcore3.1
+      Timeout: 300
+  FSxResizerRole:
+    
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub FSxResize-Role-${AWS::StackName}-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: !Sub FSxResize-Policy-${AWS::StackName}-${AWS::Region}
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Effect: Allow
+            Action:
+            - fsx:UpdateFileSystem
+            Resource: !Sub 'arn:${AWS::Partition}:fsx:${AWS::Region}:${AWS::AccountId}:file-system/${FileSystemId}'
+          - Effect: Allow
+            Action:
+            - fsx:DescribeFileSystems
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${FileSystemId}-threshold-alarm-notification-${AWS::StackName}'
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricAlarm
+            Resource: !Sub  'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Low free storage capacity alarm - ${AWS::StackName}-${FileSystemId}'
+  LowFreeDataStorageCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+      - !Ref SNSTopic
+      AlarmDescription: !Join [ '', [ 'Low free storage capacity alarm - ', !Ref "AWS::StackName", '-',!Ref FileSystemId ] ]
+      AlarmName: !Join [ '', [ 'Low free storage capacity alarm - ', !Ref "AWS::StackName", '-', !Ref FileSystemId ], ]
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+      - Name: FileSystemId
+        Value: !Ref FileSystemId
+      EvaluationPeriods: 1
+      MetricName: FreeStorageCapacity
+      Namespace: AWS/FSx
+      Period: 60
+      Statistic: Sum
+      Threshold: !GetAtt GetSpaceinBytes.Response
+      TreatMissingData: missing
+
+ 
+  snsKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'sns.amazonaws.com'
+          Action:
+          - 'kms:Encrypt'
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:CreateGrant'
+          - 'kms:ListGrants'
+          - 'kms:DescribeKey'
+          Resource: '*'
+
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'cloudwatch.amazonaws.com'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:GenerateDataKey*'
+          Resource: '*'
+
+        - Effect: Allow
+          Principal: 
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${FSxResizerRole}'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:GenerateDataKey*'
+          Resource: '*'
+
+  SNSTopic: 
+    Type: AWS::SNS::Topic
+    DependsOn: snsKey
+    Properties: 
+      DisplayName: !Join [ '', [ !Ref FileSystemId, '-threshold-alarm-notification-', !Ref "AWS::StackName" ] ]
+      Subscription:
+      - Endpoint: !Ref EmailAddress
+        Protocol: "email"
+      - Endpoint: !GetAtt FSxResizer.Arn
+        Protocol: lambda
+      TopicName: !Join [ '', [ !Ref FileSystemId, '-threshold-alarm-notification-', !Ref "AWS::StackName" ] ]
+      KmsMasterKeyId: !Ref snsKey
+
+  ResizerFunctionInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref FSxResizer
+      Principal: sns.amazonaws.com   
+  SNSTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sns:Publish'
+            Resource: !Ref SNSTopic
+            Principal:
+              AWS: '*'
+            Condition:
+              ArnLike:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Low free storage capacity alarm - ${AWS::StackName}-${FileSystemId}'
+Outputs:
+  AlarmFreeSpaceThreshold:
+    Description: Size in Bytes
+    Value: !GetAtt GetSpaceinBytes.Response
+
+  
